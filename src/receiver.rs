@@ -325,6 +325,62 @@ mod tests {
     }
 
     #[test]
+    fn split_packs_at_the_exact_boundary() {
+        let entry = format!("\"{}\"", "a".repeat(38)); // 40 bytes
+        let body = format!("{{\"value\":[{entry},{entry},{entry}]}}");
+        // Two entries make exactly 93 bytes.
+        let parts = split_body(&body, 93);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 93);
+        let parts = split_body(&body, 92);
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.len() == 52));
+        // One byte short of a single entry drops everything.
+        assert!(split_body(&body, 51).is_empty());
+        assert_eq!(split_body(&body, 52).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn body_of_exactly_max_is_accepted() {
+        let (_r, mut rx, base) = up().await;
+        let response = client()
+            .post(format!("{base}/graph/{CH}"))
+            .body(vec![b'a'; MAX_BODY])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 202);
+        assert_eq!(rx.recv().await.unwrap().body.len(), MAX_BODY);
+    }
+
+    #[tokio::test]
+    async fn validation_decodes_the_url_encoded_token() {
+        let (_r, _rx, base) = up().await;
+        let response = client()
+            .post(format!(
+                "{base}/graph/{CH}?validationToken=Validation%3A%20Testing%20client%20application"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.text().await.unwrap(),
+            "Validation: Testing client application"
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_traversal_channels_are_404() {
+        let (_r, mut rx, base) = up().await;
+        let c = client();
+        for path in ["graph/..%2f..%2fx", "graph/%2e%2e", "graph/%00"] {
+            let r = c.post(format!("{base}/{path}")).body("x").send().await;
+            assert_eq!(r.unwrap().status(), 404, "{path}");
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn split_drops_an_entry_that_alone_is_too_big() {
         let big = format!("\"{}\"", "b".repeat(200));
         let body = format!("{{\"value\":[1,{big},2]}}");

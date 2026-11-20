@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -226,12 +226,21 @@ pub async fn run(
         .await;
 }
 
+/// Longest piece of output read as one line.
+const MAX_LINE: u64 = 16 * 1024;
+
 async fn read_lines<R: AsyncRead + Unpin>(reader: R, tx: mpsc::Sender<String>) {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
+        // Cap one read so a child that never prints a newline cannot grow
+        // the buffer without bound; the rest arrives as the next line.
+        match (&mut reader)
+            .take(MAX_LINE)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
             Ok(0) | Err(_) => return,
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf).trim_end().to_string();
@@ -473,6 +482,18 @@ mod tests {
                 reason: "cloudflared stopped".into()
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn read_lines_caps_a_line_without_newline() {
+        let data = vec![b'a'; MAX_LINE as usize * 2 + 5];
+        let (tx, mut rx) = mpsc::channel(8);
+        read_lines(&data[..], tx).await;
+        let mut sizes = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            sizes.push(line.len());
+        }
+        assert_eq!(sizes, vec![MAX_LINE as usize, MAX_LINE as usize, 5]);
     }
 
     #[tokio::test]

@@ -34,6 +34,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// A tunnel that ran this long counts as healthy: the next wait starts over.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for `options` after `ready` before using the defaults.
+const OPTIONS_WAIT: Duration = Duration::from_secs(3);
 
 pub type TunnelFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -168,6 +170,9 @@ struct Plugin<W> {
     restart_at: Option<Instant>,
     check_pending: bool,
     check_tx: mpsc::UnboundedSender<bool>,
+    options_seen: bool,
+    /// When to start with the defaults if Chaat has sent no options yet.
+    fallback_at: Option<Instant>,
 }
 
 impl<W: AsyncWrite + Unpin> Plugin<W> {
@@ -223,6 +228,8 @@ impl<W: AsyncWrite + Unpin> Plugin<W> {
         values: &serde_json::Map<String, Value>,
         tunnel_rx: &mut Option<mpsc::Receiver<TunnelEvent>>,
     ) -> std::io::Result<()> {
+        self.options_seen = true;
+        self.fallback_at = None;
         let new = match setup_from(values) {
             Ok(setup) => Some(setup),
             Err(message) => {
@@ -354,16 +361,24 @@ where
         restart_at: None,
         check_pending: false,
         check_tx,
+        options_seen: false,
+        fallback_at: None,
     };
 
     let result = async {
         loop {
             let restart_at = plugin.restart_at;
+            let fallback_at = plugin.fallback_at;
             select! {
                 line = lines.recv() => {
                     let Some(line) = line else { break };
                     match protocol::parse_incoming(line.trim()) {
-                        Some(Incoming::Hello) => plugin.send(protocol::ready()).await?,
+                        Some(Incoming::Hello) => {
+                            plugin.send(protocol::ready()).await?;
+                            if !plugin.options_seen {
+                                plugin.fallback_at = Some(Instant::now() + OPTIONS_WAIT);
+                            }
+                        }
                         Some(Incoming::Options { values }) => {
                             plugin.options(&values, &mut tunnel_rx).await?;
                         }
@@ -399,6 +414,16 @@ where
                 } => {
                     plugin.restart_at = None;
                     plugin.start_tunnel(&mut tunnel_rx).await?;
+                }
+                _ = async {
+                    match fallback_at {
+                        Some(at) => sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Chaat sends options right after `ready`; if none came, start
+                    // with the defaults rather than never.
+                    plugin.options(&serde_json::Map::new(), &mut tunnel_rx).await?;
                 }
                 Some(ok) = check_rx.recv() => plugin.check_done(ok).await?,
             }
@@ -769,6 +794,28 @@ mod tests {
         );
         assert!(first.dropped.load(Ordering::SeqCst));
         assert_eq!(h.recv().await["type"], "push_down");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_starts_with_defaults_when_no_options_arrive() {
+        let mut h = harness(None);
+        h.say(&fixture("hello.json").to_string()).await;
+        assert_eq!(h.recv().await["type"], "ready");
+        let launch = h.launch().await;
+        assert_eq!(launch.setup.kind, TunnelKind::Quick);
+        assert_eq!(h.recv().await["message"], "Starting the tunnel");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn options_arriving_cancel_the_fallback() {
+        let mut h = harness(None);
+        h.say(&fixture("hello.json").to_string()).await;
+        h.recv().await;
+        h.say(r#"{"v":1,"type":"options","values":{"tunnel":"named"}}"#)
+            .await;
+        assert_eq!(h.recv().await["state"], "error");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(h.launches.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]

@@ -40,7 +40,13 @@ Chaat, that address wins and the plugin is not used.
 
 ## Tunnels
 
-The plugin always runs cloudflared with `--protocol http2`.
+The plugin always runs cloudflared with `--protocol http2`. For both kinds the
+tunnel counts as up only after cloudflared reports a registered connection, so
+Graph's first validation request can reach it.
+
+Chaat runs each plugin in a Job Object that kills its processes when the plugin
+ends on Windows, and in its own process group on Unix, so cloudflared does not
+outlive a plugin that is killed.
 
 **Quick tunnel (default).** No account needed. cloudflared gives a
 `trycloudflare.com` address that changes each time the tunnel starts. Chaat

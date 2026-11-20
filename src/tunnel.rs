@@ -180,6 +180,9 @@ pub async fn run(
     drop(lines_tx);
 
     let mut up = false;
+    // Quick tunnels: the parsed URL, and whether a registration line came.
+    let mut pending: Option<String> = None;
+    let mut seen_registration = false;
     let mut exited = false;
     loop {
         let line = if exited {
@@ -206,11 +209,24 @@ pub async fn run(
         if up {
             continue;
         }
+        let registered = named_ready(&line);
         let url = match &kind {
-            TunnelKind::Quick => quick_url(&line),
-            TunnelKind::Named { hostname, .. } => {
-                named_ready(&line).then(|| format!("https://{hostname}"))
+            TunnelKind::Quick => {
+                if pending.is_none() {
+                    pending = quick_url(&line);
+                }
+                // Up only once cloudflared has registered a connection, so
+                // the first validation request can reach the tunnel.
+                if registered {
+                    seen_registration = true;
+                }
+                if seen_registration {
+                    pending.take()
+                } else {
+                    None
+                }
             }
+            TunnelKind::Named { hostname, .. } => registered.then(|| format!("https://{hostname}")),
         };
         if let Some(url) = url {
             up = true;
@@ -434,9 +450,39 @@ mod tests {
         events
     }
 
+    /// Like `echo`, with two lines in order.
+    fn echo2(first: &str, second: &str) -> (PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            (
+                PathBuf::from("cmd"),
+                vec!["/C".into(), format!("echo {first}& echo {second}")],
+            )
+        } else {
+            (
+                PathBuf::from("sh"),
+                vec!["-c".into(), format!("echo '{first}'; echo '{second}'")],
+            )
+        }
+    }
+
     #[tokio::test]
-    async fn run_reports_quick_url_then_stopped() {
+    async fn quick_up_waits_for_registration() {
         let (program, args) = echo("INF https://quiet-river-12ab.trycloudflare.com");
+        let events = collect(program, args, TunnelKind::Quick).await;
+        assert_eq!(
+            events,
+            vec![TunnelEvent::Down {
+                reason: "cloudflared stopped".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_reports_up_then_down() {
+        let (program, args) = echo2(
+            "INF https://quiet-river-12ab.trycloudflare.com",
+            "INF Registered tunnel connection connIndex=0",
+        );
         let events = collect(program, args, TunnelKind::Quick).await;
         assert_eq!(
             events,

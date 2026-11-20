@@ -1,0 +1,1 @@
+{"v":1,"type":"hello","host":"chaat","capabilities":["call_alerts","push"],"accounts":[{"id":"o1.t1","username":"ada@contoso.com"}],"forget":["o9.t9"]}

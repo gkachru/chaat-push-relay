@@ -1,0 +1,29 @@
+[package]
+name = "chaat-push-relay"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A plugin for Chaat that receives Microsoft Graph change notifications through a cloudflared tunnel"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "chaat-push-relay"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime: the receiver, the cloudflared child process, stdio for the plugin protocol.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "sync", "time"] }
+# Local HTTP receiver for Graph notifications (HTTP/1 only, bound to 127.0.0.1).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+# Plugin JSON lines and notification bodies.
+serde_json = "1"
+# The "Check the tunnel" action posts a validation request to the public URL.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+# Random check tokens.
+getrandom = "0.3"
+
+[dev-dependencies]
+# start_paused and time control in tests.
+tokio = { version = "1", features = ["test-util"] }

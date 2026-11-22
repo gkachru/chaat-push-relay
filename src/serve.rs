@@ -169,6 +169,9 @@ struct Plugin<W> {
     started_at: Instant,
     restart_at: Option<Instant>,
     check_pending: bool,
+    /// The outcome of the check Chaat shows now (true: passed), so a tunnel
+    /// that goes up or down never leaves an answer that contradicts it.
+    check_shown: Option<bool>,
     check_tx: mpsc::UnboundedSender<bool>,
     options_seen: bool,
     /// When to start with the defaults if Chaat has sent no options yet.
@@ -257,6 +260,16 @@ impl<W: AsyncWrite + Unpin> Plugin<W> {
         if was_up {
             self.send(protocol::push_down("tunnel options changed"))
                 .await?;
+            self.check_went_down().await?;
+        }
+        Ok(())
+    }
+
+    /// A passed check is no longer true once the tunnel is down.
+    async fn check_went_down(&mut self) -> std::io::Result<()> {
+        if self.check_shown == Some(true) {
+            self.check_shown = Some(false);
+            self.status("check", "error", NOT_UP_MESSAGE).await?;
         }
         Ok(())
     }
@@ -267,7 +280,12 @@ impl<W: AsyncWrite + Unpin> Plugin<W> {
                 self.up_url = Some(url.clone());
                 self.send(protocol::push_ready(&url)).await?;
                 let message = format!("Tunnel up at {}", host_of(&url));
-                self.status("tunnel", "ok", &message).await
+                self.status("tunnel", "ok", &message).await?;
+                // A failed check from before is stale: check again.
+                if self.check_shown == Some(false) {
+                    self.action("check").await?;
+                }
+                Ok(())
             }
             TunnelEvent::Down { reason } => {
                 self.up_url = None;
@@ -278,7 +296,8 @@ impl<W: AsyncWrite + Unpin> Plugin<W> {
                 }
                 self.restart_at = Some(Instant::now() + self.backoff);
                 self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-                self.status("tunnel", "error", &reason).await
+                self.status("tunnel", "error", &reason).await?;
+                self.check_went_down().await
             }
         }
     }
@@ -288,9 +307,11 @@ impl<W: AsyncWrite + Unpin> Plugin<W> {
             return Ok(());
         }
         let Some(base) = self.up_url.clone() else {
+            self.check_shown = Some(false);
             return self.status("check", "error", NOT_UP_MESSAGE).await;
         };
         let Ok(token) = random_token() else {
+            self.check_shown = Some(false);
             return self.status("check", "error", CHECK_FAILED_MESSAGE).await;
         };
         self.receiver.allow_check(Some(token.clone()));
@@ -305,6 +326,7 @@ impl<W: AsyncWrite + Unpin> Plugin<W> {
     async fn check_done(&mut self, ok: bool) -> std::io::Result<()> {
         self.check_pending = false;
         self.receiver.allow_check(None);
+        self.check_shown = Some(ok);
         if ok {
             self.status("check", "ok", CHECK_OK_MESSAGE).await
         } else {
@@ -360,6 +382,7 @@ where
         started_at: Instant::now(),
         restart_at: None,
         check_pending: false,
+        check_shown: None,
         check_tx,
         options_seen: false,
         fallback_at: None,
@@ -712,8 +735,9 @@ mod tests {
             .unwrap();
         h.recv().await; // push_ready
         h.recv().await; // tunnel status
-        h.say(r#"{"v":1,"type":"action","id":"check"}"#).await;
+        // The earlier "not up yet" is stale: the plugin checks again itself.
         let working = h.recv().await;
+        assert_eq!(working["id"], "check");
         assert_eq!(working["state"], "working");
         let ok = h.recv().await;
         assert_eq!(ok["id"], "check");
@@ -737,6 +761,39 @@ mod tests {
         let failed = h.recv().await;
         assert_eq!(failed["state"], "error");
         assert_eq!(failed["message"], CHECK_FAILED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn a_passed_check_turns_to_not_up_when_the_tunnel_goes_down() {
+        let mut h = harness(None);
+        let launch = h.start().await;
+        launch
+            .events
+            .send(TunnelEvent::Up {
+                url: format!("http://127.0.0.1:{}", launch.port),
+            })
+            .await
+            .unwrap();
+        h.recv().await; // push_ready
+        h.recv().await; // tunnel status
+        h.say(r#"{"v":1,"type":"action","id":"check"}"#).await;
+        assert_eq!(h.recv().await["state"], "working");
+        assert_eq!(h.recv().await["state"], "ok");
+        launch
+            .events
+            .send(TunnelEvent::Down {
+                reason: "cloudflared stopped".into(),
+            })
+            .await
+            .unwrap();
+        h.recv().await; // push_down
+        let tunnel = h.recv().await;
+        assert_eq!(tunnel["id"], "tunnel");
+        assert_eq!(tunnel["state"], "error");
+        let check = h.recv().await;
+        assert_eq!(check["id"], "check");
+        assert_eq!(check["state"], "error");
+        assert_eq!(check["message"], NOT_UP_MESSAGE);
     }
 
     #[tokio::test]

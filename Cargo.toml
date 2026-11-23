@@ -27,3 +27,20 @@ getrandom = "0.3"
 [dev-dependencies]
 # start_paused and time control in tests.
 tokio = { version = "1", features = ["test-util"] }
+
+# Debian and Ubuntu package (cargo deb). Built by packaging/deb.sh.
+[package.metadata.deb]
+name = "chaat-push-relay"
+maintainer = "Gautam K <6730544+gkachru@users.noreply.github.com>"
+section = "net"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Receives Microsoft Graph change notifications for Chaat through a cloudflared tunnel. Chaat starts this program when you add it in Settings > Plugins. Chaat does not install or update it."""
+depends = "libc6 (>= 2.35), ca-certificates"
+recommends = "cloudflared"
+suggests = "chaat"
+assets = [
+    ["target/release/chaat-push-relay", "usr/lib/chaat/plugins/chaat-push-relay", "755"],
+    ["README.md", "usr/share/doc/chaat-push-relay/README.md", "644"],
+]

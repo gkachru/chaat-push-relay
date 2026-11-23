@@ -30,6 +30,26 @@ You also need `cloudflared`. Install it yourself from Cloudflare. The plugin
 never installs or updates it. It looks for `cloudflared` on your PATH, or at
 the path in the "cloudflared program" option.
 
+## Install on Debian or Ubuntu
+
+For Ubuntu 22.04 or later and Debian 12 or later (amd64). Build the package
+with `packaging/deb.sh` (needs `cargo-deb`, `cargo-zigbuild` and `zig`), then:
+
+```
+sudo apt install ./dist/chaat-push-relay_0.1.0-1_amd64.deb
+```
+
+In Chaat, open Settings > Plugins, choose Add plugin and pick
+`/usr/lib/chaat/plugins/chaat-push-relay`. After you upgrade the package, Chaat
+sees a changed file and asks you to approve it before it runs again.
+
+`cloudflared` is not in the Debian or Ubuntu archives. The package only
+recommends it. Add Cloudflare's APT repository by following the instructions at
+https://pkg.cloudflare.com/ (check the current steps there), then
+`sudo apt install cloudflared`. With that repository set up, apt also installs
+it as a recommended package. The plugin itself never installs or updates
+cloudflared; apt does, when you ask it to.
+
 ## Add it in Chaat
 
 In Chaat, open Settings > Plugins, choose Add plugin and pick the

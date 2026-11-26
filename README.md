@@ -84,6 +84,14 @@ cloudflared tunnel route dns <name> <hostname>
 Then set the options below to the tunnel name (or the path of its config
 file, ending in `.yml`, `.yaml` or `.json`) and the public hostname.
 
+Starting a tunnel by name makes cloudflared look the name up through
+Cloudflare's API, so the tunnel cannot start while that API fails. The
+plugin remembers the tunnel ID cloudflared prints the first time the tunnel
+comes up by name, and later starts use the ID, which needs only the local
+credentials file. If a start by the remembered ID fails before the tunnel is
+up, the plugin forgets it and the next start goes by name. You can also
+enter the tunnel's ID instead of its name.
+
 ## Options
 
 | Option | Meaning |
@@ -106,7 +114,7 @@ Status texts shown under Tunnel:
 | cloudflared was not found | No cloudflared at the option's path or on PATH. No retry until you change the options |
 | Set the tunnel's public hostname | Named tunnel without a hostname |
 | Set the tunnel's name | Named tunnel without a name or config |
-| cloudflared stopped | cloudflared exited. It restarts after 1 second, then 2, 4 and so on up to 60 seconds. A tunnel that ran for a minute starts over at 1 second |
+| cloudflared stopped | cloudflared exited. When it printed an error, the text follows ("cloudflared stopped: ...", at most 160 characters). It restarts after 1 second, then 2, 4 and so on up to 60 seconds. A tunnel that ran for a minute starts over at 1 second |
 | cloudflared could not start | The program could not be run. Same restart schedule |
 
 Status texts shown under Check the tunnel:
@@ -128,6 +136,14 @@ Status texts shown under Check the tunnel:
   the timing.
 - The plugin never logs bodies, channels or addresses with a query. Logs go
   to stderr, which Chaat discards. It has no telemetry.
+- It writes one file: `tunnel-ids.json`, mapping named tunnels to their IDs,
+  in `%LOCALAPPDATA%\chaat-push-relay` on Windows,
+  `~/Library/Application Support/chaat-push-relay` on macOS, and
+  `$XDG_STATE_HOME/chaat-push-relay` (or `~/.local/state/chaat-push-relay`)
+  elsewhere. Tunnel IDs are not secret.
+- cloudflared's error lines are passed to Chaat as the tunnel's status, cut
+  to 160 characters. They can name hosts and IP addresses, never the
+  tunnel's secret.
 - Chaat sends the plugin only its own channel names for each account, and the
   plugin accepts a request only on one of those channels.
 

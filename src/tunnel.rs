@@ -1,13 +1,15 @@
 //! The cloudflared child process.
 //!
 //! This module only runs a cloudflared the person already installed; it never
-//! installs or updates one. Output lines are parsed for the public address and
-//! never logged. Restart and backoff belong to the caller.
+//! installs or updates one. Output lines are parsed for the public address,
+//! the tunnel ID and the last error, and never logged. Restart and backoff
+//! belong to the caller.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -75,7 +77,7 @@ fn find_in(option: Option<&str>, path: Option<OsString>) -> Result<PathBuf, Tunn
     Err(TunnelError::NotFound)
 }
 
-fn is_config_path(text: &str) -> bool {
+pub(crate) fn is_config_path(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [".yml", ".yaml", ".json"]
         .iter()
@@ -131,6 +133,38 @@ pub fn quick_url(line: &str) -> Option<String> {
     None
 }
 
+/// The tunnel ID in cloudflared's start line (`Starting tunnel
+/// tunnelID=<uuid>`).
+pub fn tunnel_id(line: &str) -> Option<String> {
+    let at = line.find("tunnelID=")? + "tunnelID=".len();
+    let id = line.get(at..at + 36)?;
+    crate::ids::is_id(id).then(|| id.to_ascii_lowercase())
+}
+
+/// Longest error text passed on, in characters.
+const MAX_ERROR: usize = 160;
+
+/// cloudflared's words when something fails: an `ERR` or `FTL` log line
+/// after its level, or a bare `error ...` line it prints before exiting.
+pub fn error_text(line: &str) -> Option<String> {
+    let line = line.trim();
+    let text = [" ERR ", " FTL "]
+        .iter()
+        .find_map(|level| line.split_once(level).map(|(_, rest)| rest.trim()))
+        .or_else(|| {
+            let lower = line.to_ascii_lowercase();
+            (lower.starts_with("error") || lower.starts_with("failed")).then_some(line)
+        })?;
+    if text.is_empty() {
+        return None;
+    }
+    let mut cut: String = text.chars().take(MAX_ERROR).collect();
+    if text.chars().count() > MAX_ERROR {
+        cut.push('…');
+    }
+    Some(cut)
+}
+
 /// True for the line cloudflared prints when a named tunnel is connected.
 pub fn named_ready(line: &str) -> bool {
     line.contains("Registered tunnel connection")
@@ -146,6 +180,18 @@ pub async fn run(
     args: Vec<String>,
     kind: TunnelKind,
     events: mpsc::Sender<TunnelEvent>,
+) {
+    run_watching(program, args, kind, events, Arc::default()).await;
+}
+
+/// [`run`], also putting the tunnel ID cloudflared prints into `id` as soon
+/// as it appears, before `Up` is sent.
+pub async fn run_watching(
+    program: PathBuf,
+    args: Vec<String>,
+    kind: TunnelKind,
+    events: mpsc::Sender<TunnelEvent>,
+    id: Arc<Mutex<Option<String>>>,
 ) {
     let mut command = Command::new(program);
     command
@@ -180,6 +226,7 @@ pub async fn run(
     drop(lines_tx);
 
     let mut up = false;
+    let mut last_error: Option<String> = None;
     // Quick tunnels: the parsed URL, and whether a registration line came.
     let mut pending: Option<String> = None;
     let mut seen_registration = false;
@@ -206,6 +253,12 @@ pub async fn run(
                 }
             }
         };
+        if let Some(error) = error_text(&line) {
+            last_error = Some(error);
+        }
+        if let Some(found) = tunnel_id(&line) {
+            *id.lock().unwrap_or_else(|p| p.into_inner()) = Some(found);
+        }
         if up {
             continue;
         }
@@ -235,11 +288,11 @@ pub async fn run(
             }
         }
     }
-    let _ = events
-        .send(TunnelEvent::Down {
-            reason: "cloudflared stopped".into(),
-        })
-        .await;
+    let reason = match last_error {
+        Some(error) => format!("cloudflared stopped: {error}"),
+        None => "cloudflared stopped".into(),
+    };
+    let _ = events.send(TunnelEvent::Down { reason }).await;
 }
 
 /// Longest piece of output read as one line.
@@ -269,7 +322,7 @@ async fn read_lines<R: AsyncRead + Unpin>(reader: R, tx: mpsc::Sender<String>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn strings(items: &[&str]) -> Vec<String> {
@@ -426,7 +479,7 @@ mod tests {
     }
 
     /// A stand-in for cloudflared that prints one line and exits.
-    fn echo(text: &str) -> (PathBuf, Vec<String>) {
+    pub(crate) fn echo(text: &str) -> (PathBuf, Vec<String>) {
         if cfg!(windows) {
             (
                 PathBuf::from("cmd"),
@@ -451,7 +504,7 @@ mod tests {
     }
 
     /// Like `echo`, with two lines in order.
-    fn echo2(first: &str, second: &str) -> (PathBuf, Vec<String>) {
+    pub(crate) fn echo2(first: &str, second: &str) -> (PathBuf, Vec<String>) {
         if cfg!(windows) {
             (
                 PathBuf::from("cmd"),
@@ -550,6 +603,55 @@ mod tests {
             events,
             vec![TunnelEvent::Down {
                 reason: "cloudflared could not start".into()
+            }]
+        );
+    }
+
+    const ID: &str = "aac14e53-a718-4a8b-a55f-2980aaf379cd";
+
+    #[test]
+    fn tunnel_id_from_the_start_line() {
+        let line = format!("2026-11-26T16:15:12Z INF Starting tunnel tunnelID={ID}");
+        assert_eq!(tunnel_id(&line), Some(ID.to_owned()));
+        assert_eq!(tunnel_id("INF Starting tunnel tunnelID=chaat-relay"), None);
+        assert_eq!(tunnel_id("INF Version 2026.11.2"), None);
+    }
+
+    #[test]
+    fn error_text_from_log_and_bare_lines() {
+        assert_eq!(
+            error_text(
+                "error parsing tunnel ID: Error Parsing page 1: REST request failed: API call to list tunnels failed with status 503: Service Unavailable"
+            )
+            .as_deref(),
+            Some(
+                "error parsing tunnel ID: Error Parsing page 1: REST request failed: API call to list tunnels failed with status 503: Service Unavailable"
+            )
+        );
+        assert_eq!(
+            error_text("2026-11-26T16:15:37Z ERR  Unable to reach the origin service").as_deref(),
+            Some("Unable to reach the origin service")
+        );
+        assert_eq!(error_text("2026-11-26T16:15:12Z INF Starting tunnel"), None);
+        let long = format!("error {}", "x".repeat(400));
+        let cut = error_text(&long).unwrap();
+        assert_eq!(cut.chars().count(), MAX_ERROR + 1);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[tokio::test]
+    async fn run_says_why_cloudflared_stopped() {
+        let (program, args) =
+            echo("error parsing tunnel ID: API call to list tunnels failed with status 503");
+        let kind = TunnelKind::Named {
+            tunnel: "t".into(),
+            hostname: "push.example.com".into(),
+        };
+        let events = collect(program, args, kind).await;
+        assert_eq!(
+            events,
+            vec![TunnelEvent::Down {
+                reason: "cloudflared stopped: error parsing tunnel ID: API call to list tunnels failed with status 503".into()
             }]
         );
     }

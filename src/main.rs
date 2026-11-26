@@ -22,7 +22,7 @@ async fn main() -> ExitCode {
             let result = serve(
                 tokio::io::stdin(),
                 tokio::io::stdout(),
-                Arc::new(Cloudflared),
+                Arc::new(Cloudflared::new()),
             )
             .await;
             let code = match result {

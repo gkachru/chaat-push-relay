@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 
+use crate::ids::{self, IdCache};
 use crate::protocol::{self, Incoming};
 use crate::receiver::{Forward, MAX_LINE_BODY, Receiver, split_body};
 use crate::tunnel::{self, TunnelError, TunnelEvent, TunnelKind};
@@ -60,8 +61,27 @@ pub trait TunnelLauncher: Send + Sync + 'static {
     ) -> Result<TunnelFuture, TunnelError>;
 }
 
-/// The real thing: cloudflared.
-pub struct Cloudflared;
+/// The real thing: cloudflared. A named tunnel starts by the ID it had the
+/// last time it came up, so Cloudflare's API is needed only once (see
+/// [`crate::ids`]).
+pub struct Cloudflared {
+    ids: Option<IdCache>,
+}
+
+impl Cloudflared {
+    /// With the remembered IDs in the plugin's data directory.
+    pub fn new() -> Self {
+        Self {
+            ids: IdCache::default_location(),
+        }
+    }
+}
+
+impl Default for Cloudflared {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TunnelLauncher for Cloudflared {
     fn launch(
@@ -71,13 +91,94 @@ impl TunnelLauncher for Cloudflared {
         events: mpsc::Sender<TunnelEvent>,
     ) -> Result<TunnelFuture, TunnelError> {
         let program = tunnel::find_cloudflared(setup.cloudflared.as_deref())?;
-        let args = tunnel::args(&setup.kind, port);
-        Ok(Box::pin(tunnel::run(
+        let (kind, plan) = id_plan(&setup.kind, self.ids.as_ref());
+        let args = tunnel::args(&kind, port);
+        Ok(Box::pin(run_with_ids(
             program,
             args,
-            setup.kind.clone(),
+            kind,
             events,
+            self.ids.clone(),
+            plan,
         )))
+    }
+}
+
+/// What a start does about the tunnel's ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdPlan {
+    /// A quick tunnel, a config file or an ID: nothing.
+    Nothing,
+    /// Started by name: remember the ID once the tunnel is up.
+    Learn { name: String },
+    /// Started by the ID remembered for the name: forget it if the tunnel
+    /// stops before it is up, so the next start goes by name.
+    Remembered { name: String },
+}
+
+/// The tunnel to start, and what to do about its ID.
+pub fn id_plan(kind: &TunnelKind, ids: Option<&IdCache>) -> (TunnelKind, IdPlan) {
+    let TunnelKind::Named { tunnel, hostname } = kind else {
+        return (kind.clone(), IdPlan::Nothing);
+    };
+    if tunnel::is_config_path(tunnel) || ids::is_id(tunnel) {
+        return (kind.clone(), IdPlan::Nothing);
+    }
+    let name = tunnel.clone();
+    match ids.and_then(|ids| ids.get(&name)) {
+        Some(id) => (
+            TunnelKind::Named {
+                tunnel: id,
+                hostname: hostname.clone(),
+            },
+            IdPlan::Remembered { name },
+        ),
+        None => (kind.clone(), IdPlan::Learn { name }),
+    }
+}
+
+/// Runs cloudflared, passing its events on and carrying out `plan`.
+pub async fn run_with_ids(
+    program: std::path::PathBuf,
+    args: Vec<String>,
+    kind: TunnelKind,
+    events: mpsc::Sender<TunnelEvent>,
+    ids: Option<IdCache>,
+    plan: IdPlan,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (tx, rx) = mpsc::channel(8);
+    let runner = tunnel::run_watching(program, args, kind, tx, Arc::clone(&seen));
+    let forward = follow_ids(rx, events, ids, plan, seen);
+    tokio::join!(runner, forward);
+}
+
+/// Passes tunnel events on, remembering or forgetting the ID as `plan` says.
+async fn follow_ids(
+    mut rx: mpsc::Receiver<TunnelEvent>,
+    events: mpsc::Sender<TunnelEvent>,
+    ids: Option<IdCache>,
+    plan: IdPlan,
+    seen: Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let mut up = false;
+    while let Some(event) = rx.recv().await {
+        match (&event, &plan, &ids) {
+            (TunnelEvent::Up { .. }, IdPlan::Learn { name }, Some(ids)) => {
+                let id = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if let Some(id) = id {
+                    ids.remember(name, &id);
+                }
+            }
+            (TunnelEvent::Down { .. }, IdPlan::Remembered { name }, Some(ids)) if !up => {
+                ids.forget(name);
+            }
+            _ => {}
+        }
+        up |= matches!(event, TunnelEvent::Up { .. });
+        if events.send(event).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -933,5 +1034,124 @@ mod tests {
             .unwrap();
         assert!(result.is_ok());
         assert!(launch.dropped.load(Ordering::SeqCst));
+    }
+
+    mod ids {
+        use super::super::*;
+        use crate::tunnel::tests::{echo, echo2};
+
+        const ID: &str = "aac14e53-a718-4a8b-a55f-2980aaf379cd";
+
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "chaat-push-relay-plan-{name}-{}",
+                std::process::id()
+            ));
+            std::fs::remove_dir_all(&dir).ok();
+            dir
+        }
+
+        fn named(tunnel: &str) -> TunnelKind {
+            TunnelKind::Named {
+                tunnel: tunnel.into(),
+                hostname: "push.example.com".into(),
+            }
+        }
+
+        #[test]
+        fn a_name_starts_by_its_remembered_id() {
+            let dir = scratch("plan");
+            let cache = IdCache::in_dir(&dir);
+            assert_eq!(
+                id_plan(&named("chaat-relay"), Some(&cache)),
+                (
+                    named("chaat-relay"),
+                    IdPlan::Learn {
+                        name: "chaat-relay".into()
+                    }
+                )
+            );
+            cache.remember("chaat-relay", ID);
+            assert_eq!(
+                id_plan(&named("chaat-relay"), Some(&cache)),
+                (
+                    named(ID),
+                    IdPlan::Remembered {
+                        name: "chaat-relay".into()
+                    }
+                )
+            );
+            // An ID, a config file and a quick tunnel need nothing.
+            for kind in [named(ID), named("C:/tunnels/relay.yml"), TunnelKind::Quick] {
+                assert_eq!(id_plan(&kind, Some(&cache)), (kind, IdPlan::Nothing));
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        async fn events_of(
+            program: std::path::PathBuf,
+            args: Vec<String>,
+            cache: &IdCache,
+            plan: IdPlan,
+        ) -> Vec<TunnelEvent> {
+            let (tx, mut rx) = mpsc::channel(8);
+            run_with_ids(program, args, named("x"), tx, Some(cache.clone()), plan).await;
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            events
+        }
+
+        #[tokio::test]
+        async fn a_tunnel_up_by_name_remembers_its_id() {
+            let dir = scratch("learn");
+            let cache = IdCache::in_dir(&dir);
+            let (program, args) = echo2(
+                &format!("INF Starting tunnel tunnelID={ID}"),
+                "INF Registered tunnel connection connIndex=0",
+            );
+            let plan = IdPlan::Learn {
+                name: "chaat-relay".into(),
+            };
+            let events = events_of(program, args, &cache, plan).await;
+            assert!(matches!(events[0], TunnelEvent::Up { .. }));
+            assert_eq!(cache.get("chaat-relay"), Some(ID.to_owned()));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[tokio::test]
+        async fn a_remembered_id_that_fails_is_forgotten() {
+            let dir = scratch("forget");
+            let cache = IdCache::in_dir(&dir);
+            cache.remember("chaat-relay", ID);
+            let (program, args) = echo("error opening tunnel credentials file");
+            let plan = IdPlan::Remembered {
+                name: "chaat-relay".into(),
+            };
+            let events = events_of(program, args, &cache, plan).await;
+            assert_eq!(
+                events,
+                [TunnelEvent::Down {
+                    reason: "cloudflared stopped: error opening tunnel credentials file".into()
+                }]
+            );
+            assert_eq!(cache.get("chaat-relay"), None);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[tokio::test]
+        async fn a_remembered_id_that_came_up_is_kept() {
+            let dir = scratch("keep");
+            let cache = IdCache::in_dir(&dir);
+            cache.remember("chaat-relay", ID);
+            let (program, args) = echo("INF Registered tunnel connection connIndex=0");
+            let plan = IdPlan::Remembered {
+                name: "chaat-relay".into(),
+            };
+            events_of(program, args, &cache, plan).await;
+            assert_eq!(cache.get("chaat-relay"), Some(ID.to_owned()));
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }
